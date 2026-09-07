@@ -4,7 +4,7 @@ Dashboard com login, leitura de Excel, indicadores de cancelamento, filtros por 
 
 ## Arquivos
 
-- `app.py`: aplicação completa, Módulos 1 a 4.
+- `app.py`: aplicação completa.
 - `test_processamento.py`: testes dos cálculos e filtros.
 - `seguranca.py`: lista de acesso, hashes, tentativas e sessões.
 - `gerenciar_usuarios.py`: cadastro e remoção de usuários pelo terminal.
@@ -32,7 +32,7 @@ python -m unittest discover -v
 
 ## Autorizar usuários
 
-Não existe mais usuário ou senha padrão. Sem cadastro, ninguém entra. No terminal da pasta Dashboard, execute para cada pessoa autorizada, substituindo `nome_do_usuario`:
+Sem cadastro, ninguém entra. No terminal da pasta Dashboard, execute para cada pessoa autorizada, substituindo `nome_do_usuario`:
 
 ```powershell
 python gerenciar_usuarios.py nome_do_usuario
