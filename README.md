@@ -1,131 +1,138 @@
 # Dashboard de Agendamentos
 
-Dashboard com login, leitura de Excel, indicadores de cancelamento, filtros por mês e clínica e rankings de pacientes e profissionais.
-
-## Arquivos
-
-- `app.py`: aplicação completa.
-- `test_processamento.py`: testes dos cálculos e filtros.
-- `seguranca.py`: lista de acesso, hashes, tentativas e sessões.
-- `gerenciar_usuarios.py`: cadastro e remoção de usuários pelo terminal.
-- `historico.py`: armazenamento de arquivos e registros no PostgreSQL.
-- `test_historico.py` e `test_historico_interface.py`: persistência, consolidação e filtros do histórico.
-- `test_seguranca.py`, `test_acesso.py` e `test_leitura.py`: testes de segurança, interface e arquivos.
-- `requirements.txt`: dependências com as versões validadas localmente.
-- `.python-version`: Python 3.14 para o Render.
-- `.gitignore`: exclui planilhas, credenciais locais e arquivos temporários do Git.
+Aplicação Streamlit para analisar relatórios Excel de agendamentos, com autenticação pelo Supabase e histórico persistente isolado por clínica por meio de Row Level Security (RLS).
 
 ## Executar localmente
 
-Na pasta Dashboard, com Python 3.14:
+Requisitos: Python 3.14 e um projeto Supabase configurado conforme as seções seguintes.
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-Para executar os testes:
+No Linux ou macOS, ative o ambiente com `source .venv/bin/activate`.
 
-```powershell
-python -m unittest discover -v
+O dashboard aceita `.xlsx` por upload manual, pela pasta de `app.py` ou pelo histórico no Supabase. O upload manual permanece apenas na sessão atual. O histórico armazena o arquivo original e os dados processáveis no banco da clínica autenticada.
+
+## 1. Criar a estrutura no Supabase
+
+No projeto **Dashboard**, abra **SQL Editor**, crie uma consulta, copie todo o conteúdo de [`supabase/migrations/202609110001_auth_rls_clinicas.sql`](supabase/migrations/202609110001_auth_rls_clinicas.sql) e execute uma vez.
+
+A migração cria:
+
+- `clinicas`, com uma linha por clínica;
+- `perfis`, ligando uma conta do Supabase Auth a uma clínica;
+- `dashboard_arquivos`, isolada por clínica;
+- uma função transacional para importar lotes;
+- grants mínimos e policies RLS para usuários autenticados.
+
+Requisições anônimas não recebem acesso. O aplicativo não recebe permissão para editar ou excluir dados. A clínica e o importador são derivados no banco a partir de `auth.uid()`; campos enviados pelo cliente não podem trocar a clínica.
+
+## 2. Desabilitar cadastro público
+
+Nas configurações de **Authentication**, desabilite novos cadastros públicos. As contas devem ser criadas somente por quem administra o projeto.
+
+Não use um e-mail pessoal. Para manter o login visível apenas por nome, cada conta usa internamente:
+
+```text
+nome-normalizado@login.dashboard.local
 ```
 
-## Autorizar usuários
+O nome aceita apenas letras sem acento, números, `_`, `.` e `-`, com até 64 caracteres. Ele é convertido para minúsculas. Exemplo: o login `Clinica.Matriz` corresponde internamente a `clinica.matriz@login.dashboard.local`.
 
-Sem cadastro, ninguém entra. No terminal da pasta Dashboard, execute para cada pessoa autorizada, substituindo `nome_do_usuario`:
+## 3. Criar a conta e associar a clínica
 
-```powershell
-python gerenciar_usuarios.py nome_do_usuario
+1. Em **Authentication → Users**, crie o usuário com o e-mail técnico, uma senha forte e confirmação administrativa.
+2. Copie o UUID do usuário criado.
+3. No SQL Editor, execute a transação abaixo depois de substituir os três marcadores. O `nome-normalizado` deve ser exatamente a parte anterior a `@login.dashboard.local`.
+
+```sql
+begin;
+
+with nova_clinica as (
+    insert into public.clinicas (nome)
+    values ('NOME DA CLÍNICA')
+    returning id
+)
+insert into public.perfis (user_id, clinica_id, nome_usuario)
+select 'UUID DO USUÁRIO'::uuid, id, 'nome-normalizado'
+from nova_clinica;
+
+commit;
 ```
 
-Digite e confirme a senha quando solicitado; ela não aparece na tela. Use no mínimo 12 caracteres. O arquivo `.auth/usuarios.json` guarda apenas hashes PBKDF2-SHA256 com salt aleatório e 600.000 iterações; ele está excluído do Git. Use contas individuais e compartilhe a senha apenas com seu titular.
+Nesta versão, a restrição do banco permite uma conta por clínica e uma clínica por conta. Repita o processo para cada clínica.
 
-Para trocar uma senha ou revogar acesso:
+Como o endereço é técnico, a recuperação automática por e-mail não é usada. A redefinição de senha é administrativa no painel do Supabase.
 
-```powershell
-python gerenciar_usuarios.py nome_do_usuario --atualizar
-python gerenciar_usuarios.py nome_do_usuario --remover
+## 4. Configurar somente as chaves públicas
+
+Em **Project Settings → API**, copie:
+
+- **Project URL**;
+- **Publishable key**, cujo prefixo atual é `sb_publishable_`.
+
+Nunca copie para o aplicativo a **Secret key**, a chave legada `service_role` ou a senha direta do PostgreSQL. Essas credenciais ignoram o RLS.
+
+Para desenvolvimento local, crie `.streamlit/secrets.toml` — o arquivo já está ignorado pelo Git:
+
+```toml
+SUPABASE_URL = "https://SEU-PROJETO.supabase.co"
+SUPABASE_PUBLISHABLE_KEY = "SUA_CHAVE_PUBLICAVEL"
 ```
 
-Somente quem administra os arquivos do servidor pode alterar a lista. Não há cadastro público. O cadastro autoriza a pessoa a ver todas as clínicas e dados disponíveis na aplicação; filtros não são permissões por clínica.
+Também é possível usar variáveis de ambiente com os mesmos nomes. Variáveis de ambiente têm precedência sobre `st.secrets`.
 
-Em hospedagem, configure a lista também no serviço. A precedência é: variável `DASHBOARD_USERS_JSON`, secrets `[usuarios]`, arquivo local `.auth/usuarios.json`. Uma fonte externa substitui a lista local; não mescla contas.
+## 5. Validar antes de usar dados reais
 
-## Publicar no Streamlit Community Cloud
+Crie duas clínicas e duas contas fictícias. Use somente planilhas fictícias e confirme:
 
-1. Crie um repositório **privado** no GitHub e envie os arquivos de código e configuração acima, sem as planilhas dos pacientes.
-2. Acesse [Streamlit Community Cloud](https://share.streamlit.io), conecte o GitHub e autorize o acesso ao repositório privado.
-3. Clique em **Create app**, selecione repositório, branch e `app.py` como arquivo principal.
-4. Em **Advanced settings**, selecione Python **3.14**. Em **Secrets**, cadastre os nomes e copie os respectivos hashes gerados em `.auth/usuarios.json` no formato abaixo. Não use a senha em texto nem o marcador de exemplo. Clique em **Deploy**.
+- a conta A importa e lista dados da clínica A;
+- a conta B não vê os arquivos da clínica A;
+- uma conta sem perfil não entra;
+- logout exige nova autenticação;
+- uma requisição sem login não lê nem grava arquivos.
 
-   ```toml
-   [usuarios]
-   nome_do_usuario = "COLE_AQUI_O_HASH_GERADO"
-   ```
+Depois da validação, remova somente as contas, clínicas e arquivos fictícios cujos UUIDs você identificou. Não teste inicialmente com dados de pacientes.
 
-5. Abra o endereço gerado, faça login e carregue a planilha em **Upload Manual**. Para acesso por link além dos convidados da plataforma, ajuste a visibilidade do app em suas configurações de compartilhamento; o formulário de login da aplicação continuará obrigatório.
+## Publicar
 
-As etapas e a seleção de Python estão na [documentação de publicação do Streamlit](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy).
+No Streamlit Community Cloud ou Render, configure `SUPABASE_URL` e `SUPABASE_PUBLISHABLE_KEY` no painel privado do serviço. Não crie `.env` ou `secrets.toml` versionado.
 
-## Publicar no Render
-
-1. No [Render](https://dashboard.render.com), escolha **New → Web Service** e conecte o mesmo repositório privado.
-2. Selecione **Python 3** como linguagem. Mantenha a raiz do serviço na pasta que contém `app.py` e `requirements.txt`.
-3. Em **Build Command**, use `python -m pip install -r requirements.txt`.
-4. Em **Start Command**, use:
+Comando de inicialização no Render:
 
 ```bash
 python -m streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT --server.headless=true
 ```
 
-5. Em **Environment**, crie `DASHBOARD_USERS_JSON` com o conteúdo completo de `.auth/usuarios.json` (nomes e hashes). Escolha o plano e clique em **Create Web Service**. Abra o endereço gerado, faça login e envie a planilha.
+O Python é definido em `.python-version`. CORS e proteção XSRF permanecem ativos e a publicação de arquivos estáticos está desativada.
 
-O comando acima é para o ambiente Linux do Render. O arquivo `.python-version` define Python 3.14. Consulte [Web Services](https://render.com/docs/web-services) e [versão do Python](https://render.com/docs/python-version).
+## Comportamento e limites
 
-## Como os dados funcionam na nuvem
+- Sessões expiram após 30 minutos sem interação ou oito horas no total.
+- O token é validado novamente no Supabase durante o uso; conta removida, banida ou sem perfil perde acesso.
+- Logout remove o estado e o cache individual da sessão.
+- Cada arquivo deve ser `.xlsx`, ter até 20 MB e conter `Data` e `Status`.
+- Cada importação aceita até 20 arquivos e 100 MB no total.
+- O lote é transacional: uma falha impede gravação parcial.
+- O mesmo conteúdo é deduplicado dentro da clínica, mas pode existir em clínicas diferentes.
+- Todos os registros de um relatório pertencem à clínica da conta que o importou; valores da coluna `Criado por` são apenas dimensões analíticas, não autorização.
 
-Use **Upload Manual** após o login. O upload não grava a planilha na pasta do projeto e não cria uma base compartilhada persistente; cada sessão envia seu arquivo novamente quando necessário.
+## Testes
 
-**Pasta Automática** consulta a pasta de `app.py` no servidor. Ela não acessa Downloads ou OneDrive do seu computador.
+```bash
+python -m unittest discover -v
+```
 
-**Histórico na nuvem** armazena os arquivos Excel originais, seus registros, o usuário importador e a data de importação em um PostgreSQL externo. O banco é compartilhado pelos usuários autorizados e permanece independente de reinicializações do dashboard. Todos os usuários da lista atual podem importar e consultar esse histórico.
+Os testes locais usam doubles para a API e não precisam de tokens. O isolamento RLS definitivo deve ser verificado também no projeto Supabase de desenvolvimento com duas contas fictícias.
 
-## Configurar o histórico persistente
+## Referências oficiais
 
-1. Crie um banco PostgreSQL gerenciado. No Render, use **New → Postgres**, conforme a [documentação de criação e conexão](https://render.com/docs/postgresql-creating-connecting). Escolha armazenamento persistente e configure backups; a retenção depende do serviço e plano contratados.
-2. Copie a URL de conexão fornecida pelo banco para a configuração privada da aplicação. No Render, adicione a variável de ambiente `DATABASE_URL`. No Streamlit Community Cloud, adicione a chave no início de **Secrets**, antes de `[usuarios]`:
-
-   ```toml
-   DATABASE_URL = "postgresql://USUARIO:SENHA@SERVIDOR:5432/BANCO?sslmode=require"
-
-   [usuarios]
-   nome_do_usuario = "HASH_GERADO_NO_CADASTRO"
-   ```
-
-   Substitua os marcadores pela configuração real somente no painel privado. Se o dashboard estiver fora da rede do banco, utilize uma conexão externa autorizada pelo provedor. A aplicação exige TLS e não exibe a URL na tela ou nos logs de importação.
-3. Atualize as dependências com `python -m pip install -r requirements.txt` e reinicie a aplicação. A conta do banco precisa criar e consultar a tabela `dashboard_arquivos` e inserir registros nela. A tabela é criada no primeiro acesso autenticado ao histórico.
-4. Faça login, escolha **Histórico na nuvem**, selecione vários `.xlsx` e clique em **Armazenar arquivos**. Limites: 20 MB por arquivo e 100 MB por lote. Todos os arquivos precisam ter `Data` e `Status`.
-5. Selecione os **Arquivos incluídos na análise**, depois o **Ano**, os meses e as clínicas. Para o ano inteiro, mantenha todos os meses selecionados. A evolução pode ser agrupada por dia ou mês, com uma tabela de comparação mensal.
-
-Arquivos com o mesmo conteúdo são reconhecidos mesmo após renomear e não são gravados novamente. O lote é transacional: uma falha impede a gravação parcial. Relatórios originais permanecem armazenados; desmarcar um arquivo altera apenas a análise atual, sem apagá-lo.
-
-A consolidação remove somente linhas idênticas entre arquivos selecionados e preserva repetições internas de um relatório. Como o exportador não fornece ID único do agendamento, status ou outros dados diferentes **não** são mesclados automaticamente. Ao importar um relatório corrigido, desmarque a versão antiga para não somar as duas versões. A tela também avisa sobre agendamentos com paciente, data, horários e profissional iguais.
-
-O histórico representa os relatórios selecionados; não preenche meses que nunca foram importados. Arquivos originais e dados dos pacientes ficam no banco privado, não no repositório Git. Um provedor com dados persistentes e backups é necessário para sustentar esse histórico.
-
-Os testes de persistência usam SQLite temporário para validar transações e leitura após reconexão. O conector de produção aceita somente PostgreSQL. A conexão real e as permissões do provedor precisam ser verificadas após configurar `DATABASE_URL`.
-
-Os filtros afetam cartões, gráficos, rankings e tabela. “Cancelado” conta como paciente; “Cancelado pelo profissional” conta como profissional. A clínica vem de `Criado por`, mantendo grupos próprios para unidades múltiplas ou não informadas.
-
-## Controles e limites verificados
-
-- São permitidas cinco tentativas por usuário. Cinco falhas em uma janela de 15 minutos bloqueiam novas tentativas por **cinco minutos contados da quinta falha**, inclusive em outras sessões do mesmo servidor. Ao terminar o bloqueio, uma nova sequência de cinco tentativas fica disponível; um login bem-sucedido também zera as falhas.
-- Sessões expiram após 30 minutos sem interação ou oito horas de duração total. Remover um usuário ou trocar seu hash invalida a sessão na próxima revalidação. A página conectada verifica a sessão a cada 60 segundos, sem renovar a inatividade.
-- Ao usar secrets ou variável de ambiente, atualize a lista nessa fonte e reinicie o serviço para aplicar uma revogação. Alterar somente o cadastro local não muda a configuração da nuvem.
-- Logout remove estado e cache de dados da sessão. O cache de leitura é individual por sessão.
-- CORS e proteção XSRF permanecem ativos; publicação de arquivos estáticos está desativada. Use o endereço HTTPS fornecido pela hospedagem.
-- A limitação de tentativas usa `.auth/tentativas.sqlite3`. Em hospedagem com disco efêmero, o histórico se perde ao recriar o serviço; múltiplas instâncias precisam de controle de tentativas compartilhado. `DASHBOARD_AUTH_DIR` pode apontar para uma pasta persistente no servidor.
-
-Os testes automatizados verificam o comportamento local da aplicação. Não constituem um teste de invasão da hospedagem nem garantem proteção contra compartilhamento de senhas, comprometimento do servidor ou cópias já feitas por usuários autorizados. Os arquivos dos pacientes devem permanecer fora do repositório.
-
-Referências: [armazenamento de senhas da OWASP](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) e [secrets do Streamlit](https://docs.streamlit.io/develop/concepts/connections/secrets-management).
+- [Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security)
+- [Chaves da API](https://supabase.com/docs/guides/getting-started/api-keys)
+- [Login por senha no cliente Python](https://supabase.com/docs/reference/python/auth-signinwithpassword)
+- [Restauração de sessão no cliente Python](https://supabase.com/docs/reference/python/auth-setsession)

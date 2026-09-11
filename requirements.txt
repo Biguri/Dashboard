@@ -2,5 +2,4 @@ streamlit==1.63.0
 pandas==3.0.5
 openpyxl==3.1.5
 python-calamine==0.8.2
-SQLAlchemy==2.0.52
-psycopg[binary]==3.3.5
+supabase==2.31.0
