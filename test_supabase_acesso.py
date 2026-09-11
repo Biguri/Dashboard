@@ -22,8 +22,9 @@ class Resultado:
 
 
 class ConsultaPerfil:
-    def __init__(self, perfil):
+    def __init__(self, perfil, erro_consulta=None):
         self.perfil = perfil
+        self.erro_consulta = erro_consulta
 
     def select(self, colunas):
         return self
@@ -36,6 +37,8 @@ class ConsultaPerfil:
         return self
 
     def execute(self):
+        if self.erro_consulta is not None:
+            raise self.erro_consulta
         return Resultado(self.perfil)
 
 
@@ -55,7 +58,11 @@ class AuthFake:
     def sign_in_with_password(self, credenciais):
         self.login_recebido = credenciais
         if self.falhar:
-            raise RuntimeError("detalhe secreto do servidor")
+            erro = RuntimeError("Invalid login credentials")
+            erro.code = None
+            erro.status = 400
+            erro.message = "Invalid login credentials"
+            raise erro
         return self._resposta()
 
     def set_session(self, access_token, refresh_token):
@@ -76,8 +83,9 @@ class AuthFake:
 
 
 class ClienteFake:
-    def __init__(self, perfil=None, falhar=False):
+    def __init__(self, perfil=None, falhar=False, erro_consulta=None):
         self.auth = AuthFake(falhar)
+        self.erro_consulta = erro_consulta
         self.perfil = perfil if perfil is not None else {
             "user_id": USUARIO_ID,
             "clinica_id": CLINICA_ID,
@@ -88,7 +96,7 @@ class ClienteFake:
     def table(self, nome):
         if nome != "perfis":
             raise AssertionError(nome)
-        return ConsultaPerfil(self.perfil)
+        return ConsultaPerfil(self.perfil, self.erro_consulta)
 
 
 class SupabaseAcessoTests(unittest.TestCase):
@@ -128,11 +136,30 @@ class SupabaseAcessoTests(unittest.TestCase):
             entrar(cliente, "matriz", "senha")
         self.assertTrue(cliente.auth.sign_out_chamado)
 
+    def test_login_registra_codigo_seguro_de_falha_rls(self):
+        erro = RuntimeError("detalhes internos do banco")
+        erro.code = "42P17"
+        cliente = ClienteFake(erro_consulta=erro)
+        with self.assertLogs("supabase_acesso", level="WARNING") as logs, \
+                self.assertRaises(AcessoNegado) as contexto:
+            entrar(cliente, "matriz", "senha")
+        self.assertEqual(contexto.exception.etapa, "perfil_rls")
+        self.assertEqual(logs.output, [
+            "WARNING:supabase_acesso:Login recusado na etapa de perfil/RLS "
+            "(código 42P17)."
+        ])
+
     def test_login_nao_repassa_detalhe_do_sdk(self):
         cliente = ClienteFake(falhar=True)
-        with self.assertRaises(AcessoNegado) as contexto:
+        with self.assertLogs("supabase_acesso", level="WARNING") as logs, \
+                self.assertRaises(AcessoNegado) as contexto:
             entrar(cliente, "matriz", "senha")
         self.assertNotIn("servidor", str(contexto.exception))
+        self.assertEqual(contexto.exception.etapa, "auth")
+        self.assertEqual(logs.output, [
+            "WARNING:supabase_acesso:Login recusado na etapa Auth "
+            "(status 400, categoria invalid_credentials)."
+        ])
 
     def test_restauracao_atualiza_tokens(self):
         cliente = ClienteFake()

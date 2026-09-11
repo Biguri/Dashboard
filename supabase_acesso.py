@@ -1,12 +1,28 @@
 """Autenticação Supabase e contexto de clínica de uma sessão."""
 
 from dataclasses import dataclass
+import logging
 import re
 from typing import Mapping, NamedTuple
 
 
 DOMINIO_LOGIN = "login.dashboard.local"
 PADRAO_USUARIO = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+LOGGER = logging.getLogger(__name__)
+
+
+def _categoria_erro_auth(erro: Exception) -> str:
+    codigo = getattr(erro, "code", None)
+    if codigo in {"invalid_credentials", "email_not_confirmed", "over_request_rate_limit"}:
+        return codigo
+    mensagem = str(getattr(erro, "message", "")).lower()
+    if "invalid login credentials" in mensagem:
+        return "invalid_credentials"
+    if "invalid" in mensagem and "email" in mensagem:
+        return "invalid_email"
+    if "email not confirmed" in mensagem:
+        return "email_not_confirmed"
+    return "other"
 
 
 class ConfiguracaoInvalida(ValueError):
@@ -14,7 +30,9 @@ class ConfiguracaoInvalida(ValueError):
 
 
 class AcessoNegado(RuntimeError):
-    pass
+    def __init__(self, mensagem: str, etapa: str = "desconhecida"):
+        super().__init__(mensagem)
+        self.etapa = etapa
 
 
 class ConfiguracaoSupabase(NamedTuple):
@@ -103,19 +121,39 @@ def entrar(cliente, usuario: str, senha: str) -> SessaoSupabase:
         normalizado = normalizar_usuario(usuario)
         if not isinstance(senha, str) or not 1 <= len(senha) <= 1024:
             raise AcessoNegado("Credenciais inválidas.")
+    except (AcessoNegado, ValueError):
+        raise AcessoNegado("Acesso não autorizado.", "entrada") from None
+    try:
         resposta = cliente.auth.sign_in_with_password({
             "email": email_tecnico(normalizado),
             "password": senha,
         })
+    except Exception as erro:
+        status = getattr(erro, "status", "desconhecido")
+        if not isinstance(status, int):
+            status = "desconhecido"
+        LOGGER.warning(
+            "Login recusado na etapa Auth (status %s, categoria %s).",
+            status,
+            _categoria_erro_auth(erro),
+        )
+        raise AcessoNegado("Acesso não autorizado.", "auth") from None
+    try:
         return _validar_usuario(cliente, normalizado, resposta)
     except Exception as erro:
+        codigo = getattr(erro, "code", None)
+        if not isinstance(codigo, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,32}", codigo):
+            codigo = "desconhecido"
+        LOGGER.warning(
+            "Login recusado na etapa de perfil/RLS (código %s).", codigo
+        )
         try:
             cliente.auth.sign_out()
         except Exception:
             pass
         if isinstance(erro, AcessoNegado):
-            raise erro from None
-        raise AcessoNegado("Acesso não autorizado.") from None
+            raise AcessoNegado(str(erro), "perfil_rls") from None
+        raise AcessoNegado("Acesso não autorizado.", "perfil_rls") from None
 
 
 def restaurar(cliente, usuario: str, access_token: str, refresh_token: str) -> SessaoSupabase:
@@ -127,8 +165,8 @@ def restaurar(cliente, usuario: str, access_token: str, refresh_token: str) -> S
         return _validar_usuario(cliente, normalizado, resposta)
     except Exception as erro:
         if isinstance(erro, AcessoNegado):
-            raise erro from None
-        raise AcessoNegado("Sessão expirada ou revogada.") from None
+            raise AcessoNegado(str(erro), "restauracao") from None
+        raise AcessoNegado("Sessão expirada ou revogada.", "restauracao") from None
 
 
 def sair(cliente) -> None:

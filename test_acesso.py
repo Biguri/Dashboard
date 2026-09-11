@@ -33,11 +33,14 @@ class AcessoTests(unittest.TestCase):
 
     def test_login_invalido_falha_fechado_sem_detalhe_remoto(self):
         with patch.object(app.st, "session_state", self.estado), \
-                patch.object(app, "obter_cliente_supabase", side_effect=AcessoNegado("detalhe remoto")):
+                patch.object(app, "obter_cliente_supabase", side_effect=AcessoNegado("detalhe remoto", "config")), \
+                self.assertLogs("app", level="WARNING") as logs:
             app.autenticar()
         self.assertFalse(self.estado["autenticado"])
         self.assertTrue(self.estado["erro_login"])
         self.assertNotIn("login_senha", self.estado)
+        self.assertIn("config", logs.output[0])
+        self.assertNotIn("remoto", logs.output[0])
 
     def test_sessao_expirada_por_inatividade_e_limpa(self):
         agora = time.time()

@@ -69,8 +69,9 @@ def autenticar() -> None:
             "ultima_atividade": agora,
             "erro_login": False,
         })
-    except (AcessoNegado, ConfiguracaoInvalida, ValueError):
-        LOGGER.warning("Tentativa de acesso recusada.")
+    except (AcessoNegado, ConfiguracaoInvalida, ValueError) as erro:
+        LOGGER.warning("Tentativa de acesso recusada na etapa %s.",
+                       getattr(erro, "etapa", "configuracao"))
         st.session_state["autenticado"] = False
         st.session_state["usuario"] = None
         st.session_state.pop("sessao_supabase", None)
