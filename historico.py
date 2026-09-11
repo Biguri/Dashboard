@@ -1,40 +1,15 @@
-"""Histórico de arquivos e registros em PostgreSQL, independente da hospedagem."""
+"""Preparação local e histórico persistente pela Data API do Supabase."""
 
-from datetime import datetime, timezone
+import base64
 import hashlib
 import json
 from pathlib import PurePath
 
 import pandas as pd
-from sqlalchemy import (Column, DateTime, Integer, JSON, LargeBinary, MetaData,
-                        String, Table, create_engine, select, text)
-from sqlalchemy.engine import make_url
-
-METADATA = MetaData()
-ARQUIVOS = Table(
-    'dashboard_arquivos', METADATA,
-    Column('id', String(64), primary_key=True),
-    Column('nome', String(255), nullable=False),
-    Column('usuario', String(64), nullable=False),
-    Column('importado_em', DateTime(timezone=True), nullable=False),
-    Column('linhas', Integer, nullable=False),
-    Column('conteudo', LargeBinary, nullable=False),
-    Column('dados', JSON, nullable=False),
-)
 
 
-def criar_engine_postgres(url: str):
-    conexao = make_url(url)
-    if conexao.get_backend_name() not in ('postgres', 'postgresql'):
-        raise ValueError('O histórico publicado requer PostgreSQL.')
-    if not conexao.host or not conexao.database:
-        raise ValueError('Informe servidor e banco na conexão PostgreSQL.')
-    conexao = conexao.set(drivername='postgresql+psycopg')
-    if conexao.query.get('sslmode', 'require') not in ('require', 'verify-ca', 'verify-full'):
-        raise ValueError('A conexão com o histórico requer TLS.')
-    conexao = conexao.update_query_dict({'sslmode': conexao.query.get('sslmode', 'require')})
-    return create_engine(conexao, pool_pre_ping=True, pool_size=3, max_overflow=2,
-                         hide_parameters=True, connect_args={'connect_timeout': 10})
+class ErroHistorico(RuntimeError):
+    pass
 
 
 def preparar_arquivo(nome: str, conteudo: bytes, df: pd.DataFrame) -> dict:
@@ -82,47 +57,62 @@ def consolidar_arquivos(quadros: list[tuple[str, pd.DataFrame]]) -> tuple[pd.Dat
 
 
 class RepositorioHistorico:
-    def __init__(self, engine):
-        self.engine = engine
-        with self.engine.begin() as conexao:
-            self._bloquear(conexao)
-            METADATA.create_all(conexao)
+    def __init__(self, cliente):
+        self.cliente = cliente
 
-    def _bloquear(self, conexao):
-        # Serializa importações concorrentes no PostgreSQL; não bloqueia leituras.
-        if conexao.dialect.name == 'postgresql':
-            conexao.execute(text('SELECT pg_advisory_xact_lock(:chave)'), {'chave': 482731})
-
-    def importar(self, arquivos: list[dict], usuario: str) -> dict:
-        if not usuario:
-            raise ValueError('A importação precisa de um usuário identificado.')
-        resultado = {'novos': 0, 'repetidos': 0}
-        with self.engine.begin() as conexao:
-            self._bloquear(conexao)
-            existentes = set(conexao.scalars(select(ARQUIVOS.c.id)))
-            for arquivo in arquivos:
-                if arquivo['id'] in existentes:
-                    resultado['repetidos'] += 1
-                    continue
-                conexao.execute(ARQUIVOS.insert().values(
-                    **arquivo, usuario=usuario, importado_em=datetime.now(timezone.utc)
-                ))
-                existentes.add(arquivo['id'])
-                resultado['novos'] += 1
-        return resultado
+    def importar(self, arquivos: list[dict]) -> dict:
+        if not 1 <= len(arquivos) <= 20:
+            raise ValueError('O lote deve conter entre 1 e 20 arquivos.')
+        lote = [{
+            'id': arquivo['id'],
+            'nome': arquivo['nome'],
+            'linhas': arquivo['linhas'],
+            'dados': arquivo['dados'],
+            'conteudo_base64': base64.b64encode(arquivo['conteudo']).decode('ascii'),
+        } for arquivo in arquivos]
+        try:
+            resposta = self.cliente.rpc(
+                'importar_dashboard_arquivos', {'p_arquivos': lote}
+            ).execute()
+            resultado = resposta.data
+            if (not isinstance(resultado, dict)
+                    or set(resultado) != {'novos', 'repetidos'}
+                    or any(type(resultado[chave]) is not int or resultado[chave] < 0
+                           for chave in ('novos', 'repetidos'))):
+                raise ErroHistorico('Resposta inválida ao importar o histórico.')
+            return resultado
+        except ErroHistorico:
+            raise
+        except Exception:
+            raise ErroHistorico('Operação do histórico indisponível.') from None
 
     def listar(self) -> pd.DataFrame:
-        colunas = ['id', 'nome', 'usuario', 'importado_em', 'linhas']
-        consulta = select(*(ARQUIVOS.c[c] for c in colunas)).order_by(ARQUIVOS.c.importado_em, ARQUIVOS.c.id)
-        with self.engine.connect() as conexao:
-            return pd.DataFrame(conexao.execute(consulta).mappings().all(), columns=colunas)
+        colunas = ['id', 'nome', 'importado_por', 'importado_em', 'linhas']
+        try:
+            resposta = (
+                self.cliente.table('dashboard_arquivos')
+                .select(','.join(colunas))
+                .order('importado_em')
+                .order('id')
+                .execute()
+            )
+            return pd.DataFrame(resposta.data or [], columns=colunas)
+        except Exception:
+            raise ErroHistorico('Operação do histórico indisponível.') from None
 
     def carregar(self, ids: list[str]) -> tuple[pd.DataFrame, int]:
         if not ids:
             return pd.DataFrame(), 0
-        consulta = select(ARQUIVOS.c.id, ARQUIVOS.c.dados).where(ARQUIVOS.c.id.in_(ids)).order_by(
-            ARQUIVOS.c.importado_em, ARQUIVOS.c.id
-        )
-        with self.engine.connect() as conexao:
-            quadros = [(linha.id, pd.DataFrame(linha.dados)) for linha in conexao.execute(consulta)]
-        return consolidar_arquivos(quadros)
+        try:
+            resposta = (
+                self.cliente.table('dashboard_arquivos')
+                .select('id,dados')
+                .in_('id', ids)
+                .order('importado_em')
+                .order('id')
+                .execute()
+            )
+            quadros = [(linha['id'], pd.DataFrame(linha['dados'])) for linha in (resposta.data or [])]
+            return consolidar_arquivos(quadros)
+        except Exception:
+            raise ErroHistorico('Operação do histórico indisponível.') from None
