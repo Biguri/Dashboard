@@ -1,118 +1,75 @@
-import json
-import os
-from pathlib import Path
-from tempfile import TemporaryDirectory
 import time
 import unittest
 from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
-from seguranca import gerar_hash
+
+import app
+from supabase_acesso import AcessoNegado, SessaoSupabase
 
 
-class AcessoInterfaceTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.senha = 'Acesso teste privado 123!'
-        cls.hash = gerar_hash(cls.senha)
+SESSAO = SessaoSupabase(
+    usuario="matriz",
+    user_id="11111111-1111-1111-1111-111111111111",
+    clinica_id="22222222-2222-2222-2222-222222222222",
+    clinica_nome="Clínica Matriz",
+    access_token="access-token",
+    refresh_token="refresh-token",
+)
 
+
+class AcessoTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.env = patch.dict(os.environ, {
-            'DASHBOARD_USERS_JSON': json.dumps({'autorizado': self.hash}),
-            'DASHBOARD_AUTH_DIR': self.tmp.name,
-        })
-        self.env.start()
-        self.addCleanup(self.env.stop)
-        self.at = AppTest.from_file('app.py', default_timeout=15).run()
+        self.estado = {"login_usuario": "matriz", "login_senha": "senha"}
 
-    def entrar(self, usuario='autorizado', senha=None):
-        self.at.text_input(key='login_usuario').input(usuario)
-        self.at.text_input(key='login_senha').input(self.senha if senha is None else senha)
-        self.at.button[0].click().run()
-        self.assertFalse(self.at.exception)
+    def test_login_bem_sucedido_remove_senha_e_inicia_sessao(self):
+        with patch.object(app.st, "session_state", self.estado), \
+                patch.object(app, "obter_cliente_supabase", return_value=object()), \
+                patch.object(app, "entrar", return_value=SESSAO):
+            app.autenticar()
+        self.assertNotIn("login_senha", self.estado)
+        self.assertTrue(self.estado["autenticado"])
+        self.assertEqual(self.estado["sessao_supabase"], SESSAO)
 
-    def assert_bloqueado(self, at=None):
-        at = self.at if at is None else at
+    def test_login_invalido_falha_fechado_sem_detalhe_remoto(self):
+        with patch.object(app.st, "session_state", self.estado), \
+                patch.object(app, "obter_cliente_supabase", side_effect=AcessoNegado("detalhe remoto")):
+            app.autenticar()
+        self.assertFalse(self.estado["autenticado"])
+        self.assertTrue(self.estado["erro_login"])
+        self.assertNotIn("login_senha", self.estado)
+
+    def test_sessao_expirada_por_inatividade_e_limpa(self):
+        agora = time.time()
+        self.estado.update({"autenticado": True, "sessao_supabase": SESSAO,
+                            "inicio_sessao": agora - 100, "ultima_atividade": agora - 1900})
+        with patch.object(app.st, "session_state", self.estado), \
+                patch.object(app.carregar_dados, "clear"):
+            self.assertFalse(app.restaurar_sessao(agora=agora))
+        self.assertEqual(self.estado, {})
+
+    def test_restauracao_substitui_tokens_renovados(self):
+        agora = time.time()
+        renovada = SessaoSupabase(**{**SESSAO.__dict__, "access_token": "novo-access",
+                                    "refresh_token": "novo-refresh"})
+        self.estado.update({"autenticado": True, "sessao_supabase": SESSAO,
+                            "inicio_sessao": agora - 100, "ultima_atividade": agora - 10})
+        cliente = object()
+        with patch.object(app.st, "session_state", self.estado), \
+                patch.object(app, "obter_cliente_supabase", return_value=cliente), \
+                patch.object(app, "restaurar", return_value=renovada):
+            self.assertTrue(app.restaurar_sessao(agora=agora))
+        self.assertEqual(self.estado["sessao_supabase"], renovada)
+        self.assertIs(self.estado["cliente_supabase"], cliente)
+
+    def test_app_sem_configuracao_nao_exibe_dashboard(self):
+        with patch.dict("os.environ", {}, clear=True):
+            at = AppTest.from_file("app.py", default_timeout=15).run()
         self.assertFalse(at.exception)
         self.assertEqual(len(at.title), 0)
-        self.assertEqual(len(at.metric), 0)
-        self.assertEqual(len(at.dataframe), 0)
         self.assertEqual(len(at.sidebar.radio), 0)
-        self.assertEqual(len(at.get('file_uploader')), 0)
-
-    def test_anonimo_nao_recebe_dashboard_nem_upload(self):
-        self.assert_bloqueado()
-
-    def test_senha_de_exemplo_nao_abre_dashboard(self):
-        self.entrar('admin', 'Dashboard@123')
-        self.assert_bloqueado()
-
-    def test_usuario_nao_listado_negado(self):
-        self.entrar('intruso')
-        self.assert_bloqueado()
-
-    def test_senha_errada_nao_revela_se_usuario_existe(self):
-        self.entrar(senha='errada')
-        mensagem = self.at.error[0].value
-        self.entrar('intruso', 'errada')
-        self.assertEqual(self.at.error[0].value, mensagem)
-        self.assert_bloqueado()
-
-    def test_autorizado_entra_e_senha_e_removida_da_sessao(self):
-        self.entrar()
-        self.assertEqual(len(self.at.title), 1)
-        self.assertEqual(len(self.at.sidebar.radio), 1)
-        self.assertNotIn('login_senha', self.at.session_state)
-
-    def test_logout_remove_dados_e_acesso(self):
-        self.entrar()
-        self.assertEqual(len(self.at.title), 1)
-        self.at.session_state['dados_privados'] = 'conteudo'
-        self.at.sidebar.button[0].click().run()
-        self.assert_bloqueado()
-        self.assertNotIn('dados_privados', self.at.session_state)
-
-    def test_sessoes_independentes(self):
-        self.entrar()
-        self.assertEqual(len(self.at.title), 1)
-        outra = AppTest.from_file('app.py').run()
-        self.assert_bloqueado(outra)
-
-    def test_query_string_nao_concede_acesso(self):
-        self.at.query_params['autenticado'] = 'true'
-        self.at.query_params['usuario'] = 'autorizado'
-        self.at.run()
-        self.assert_bloqueado()
-
-    def test_revogacao_fecha_sessao_existente(self):
-        self.entrar()
-        self.assertEqual(len(self.at.title), 1)
-        os.environ['DASHBOARD_USERS_JSON'] = '{}'
-        self.at.run()
-        self.assert_bloqueado()
-
-    def test_expiracao_fecha_sessao_existente(self):
-        self.entrar()
-        self.assertEqual(len(self.at.title), 1)
-        self.at.session_state['ultima_atividade'] = time.time() - 1900
-        self.at.run()
-        self.assert_bloqueado()
-
-    def test_configuracao_quebrada_falha_fechada(self):
-        os.environ['DASHBOARD_USERS_JSON'] = '{invalido'
-        self.at.run()
-        self.entrar()
-        self.assert_bloqueado()
-
-    def test_bloqueio_nao_e_contornado_por_nova_sessao(self):
-        for _ in range(5):
-            self.entrar(senha='errada')
-        self.at = AppTest.from_file('app.py').run()
-        self.entrar()
-        self.assert_bloqueado()
+        self.assertEqual(len(at.text_input), 2)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

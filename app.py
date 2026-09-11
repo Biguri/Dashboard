@@ -3,25 +3,26 @@
 Execute com: python -m streamlit run app.py
 """
 
-import json
 from io import BytesIO
 import logging
 import os
 import re
-import sqlite3
+import time
 from numbers import Real
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
-from seguranca import carregar_usuarios, iniciar_sessao, sessao_autorizada, validar_login
-from historico import RepositorioHistorico, criar_engine_postgres, preparar_arquivo
+from historico import ErroHistorico, RepositorioHistorico, preparar_arquivo
+from supabase_acesso import (AcessoNegado, ConfiguracaoInvalida, carregar_configuracao,
+                             criar_cliente, entrar, restaurar, sair as encerrar_supabase)
 
 
 PASTA_DADOS = Path(__file__).resolve().parent
-PASTA_AUTH = Path(os.environ.get("DASHBOARD_AUTH_DIR", str(PASTA_DADOS / ".auth")))
 LOGGER = logging.getLogger(__name__)
+INATIVIDADE = 30 * 60
+DURACAO_MAXIMA = 8 * 60 * 60
 # Ajuste os valores para os nomes EXATOS das colunas da sua planilha.
 COLUNAS = {"data": "data", "valor": "valor", "categoria": "categoria"}
 # Regra confirmada: a unidade consta em Criado por; Cancelado é pelo paciente.
@@ -36,40 +37,47 @@ def inicializar_sessao() -> None:
     st.session_state.setdefault("usuario", None)
 
 
-def obter_usuarios() -> dict:
-    """Configuração externa tem precedência; nunca usa credenciais padrão."""
-    try:
-        configuracao = os.environ.get("DASHBOARD_USERS_JSON")
-        if configuracao is None:
+def obter_cliente_supabase():
+    """Cria um cliente por sessão; nunca compartilha tokens em cache global."""
+    valores = {
+        "SUPABASE_URL": os.environ.get("SUPABASE_URL"),
+        "SUPABASE_PUBLISHABLE_KEY": os.environ.get("SUPABASE_PUBLISHABLE_KEY"),
+    }
+    for chave in valores:
+        if valores[chave] is None:
             try:
-                usuarios_secrets = st.secrets.get("usuarios")
-                if usuarios_secrets is not None:
-                    configuracao = json.dumps(dict(usuarios_secrets))
+                valores[chave] = st.secrets.get(chave)
             except FileNotFoundError:
-                pass
-        return carregar_usuarios(PASTA_AUTH / "usuarios.json", configuracao)
-    except (ValueError, TypeError, OSError):
-        LOGGER.error("Configuração de acesso indisponível ou inválida; acesso negado.")
-        return {}
+                valores[chave] = None
+    return criar_cliente(carregar_configuracao(valores))
 
 
 def autenticar() -> None:
     """Valida o formulário antes de a página ser executada novamente."""
     usuario = st.session_state.get("login_usuario", "").strip()
     senha = st.session_state.get("login_senha", "")
-    usuarios = obter_usuarios()
     try:
-        valido = validar_login(usuario, senha, usuarios, PASTA_AUTH / "tentativas.sqlite3")
-    except (OSError, sqlite3.Error):
-        LOGGER.error("Controle de tentativas indisponível; acesso negado.")
-        valido = False
-    st.session_state.pop("login_senha", None)
-    if valido:
-        iniciar_sessao(st.session_state, usuario, usuarios[usuario])
-    else:
+        cliente = obter_cliente_supabase()
+        sessao = entrar(cliente, usuario, senha)
+        agora = time.time()
+        st.session_state.update({
+            "autenticado": True,
+            "usuario": sessao.usuario,
+            "sessao_supabase": sessao,
+            "cliente_supabase": cliente,
+            "inicio_sessao": agora,
+            "ultima_atividade": agora,
+            "erro_login": False,
+        })
+    except (AcessoNegado, ConfiguracaoInvalida, ValueError):
+        LOGGER.warning("Tentativa de acesso recusada.")
         st.session_state["autenticado"] = False
         st.session_state["usuario"] = None
+        st.session_state.pop("sessao_supabase", None)
+        st.session_state.pop("cliente_supabase", None)
         st.session_state["erro_login"] = True
+    finally:
+        st.session_state.pop("login_senha", None)
 
 
 def exibir_login() -> None:
@@ -80,14 +88,48 @@ def exibir_login() -> None:
         st.form_submit_button("Entrar", on_click=autenticar)
 
     if st.session_state.get("erro_login", False):
-        st.error("Acesso não autorizado. Confira usuário e senha. Após cinco tentativas inválidas, aguarde cinco minutos.")
+        st.error("Acesso não autorizado. Confira usuário e senha.")
+
+
+def _limpar_sessao() -> None:
+    st.session_state.clear()
+    carregar_dados.clear()
+
+
+def restaurar_sessao(agora=None, atualizar=True) -> bool:
+    """Revalida token e perfil; expiração ou inconsistência falha fechada."""
+    agora = time.time() if agora is None else agora
+    sessao = st.session_state.get("sessao_supabase")
+    inicio = st.session_state.get("inicio_sessao")
+    ultima = st.session_state.get("ultima_atividade")
+    tempos_validos = all(isinstance(valor, (int, float)) for valor in (inicio, ultima))
+    if (st.session_state.get("autenticado") is not True or sessao is None
+            or not tempos_validos or inicio > ultima or ultima > agora
+            or agora - inicio >= DURACAO_MAXIMA or agora - ultima >= INATIVIDADE):
+        _limpar_sessao()
+        return False
+    try:
+        cliente = obter_cliente_supabase()
+        renovada = restaurar(
+            cliente, sessao.usuario, sessao.access_token, sessao.refresh_token
+        )
+    except (AcessoNegado, ConfiguracaoInvalida, ValueError):
+        _limpar_sessao()
+        return False
+    st.session_state["sessao_supabase"] = renovada
+    st.session_state["usuario"] = renovada.usuario
+    st.session_state["cliente_supabase"] = cliente
+    if atualizar:
+        st.session_state["ultima_atividade"] = agora
+    return True
 
 
 def sair() -> None:
     """Encerra o acesso e remove os dados desta sessão."""
-    for chave in list(st.session_state):
-        del st.session_state[chave]
-    carregar_dados.clear()
+    cliente = st.session_state.get("cliente_supabase")
+    if cliente is not None:
+        encerrar_supabase(cliente)
+    _limpar_sessao()
 
 
 @st.cache_data(scope="session")
@@ -498,28 +540,16 @@ def exibir_dashboard(df: pd.DataFrame) -> None:
     st.dataframe(filtrado.tail(100), hide_index=True)
 
 
-@st.cache_resource
-def conectar_historico(url: str) -> RepositorioHistorico:
-    return RepositorioHistorico(criar_engine_postgres(url))
-
-
 def exibir_historico() -> Optional[pd.DataFrame]:
-    """Importação explícita; dados compartilhados apenas na área autenticada."""
-    if not sessao_autorizada(st.session_state, obter_usuarios()):
+    """Importação explícita; o RLS limita os dados à clínica da sessão."""
+    sessao = st.session_state.get("sessao_supabase")
+    cliente = st.session_state.get("cliente_supabase")
+    if sessao is None or cliente is None:
         st.stop()
-    url = os.environ.get("DATABASE_URL")
-    if url is None:
-        try:
-            url = st.secrets.get("DATABASE_URL")
-        except FileNotFoundError:
-            url = None
-    if not url:
-        st.info("O histórico ainda não está conectado. Configure DATABASE_URL nos secrets da hospedagem seguindo o README.")
-        return None
     try:
-        repo = conectar_historico(url)
+        repo = RepositorioHistorico(cliente)
         st.subheader("Histórico de agendamentos")
-        st.caption("Arquivos armazenados no banco e disponíveis aos usuários autorizados, mesmo após novas publicações do dashboard.")
+        st.caption(f"Clínica: {sessao.clinica_nome}. O banco aplica o isolamento desta conta.")
         with st.form("importar_historico"):
             uploads = st.file_uploader("Adicionar planilhas ao histórico", type=["xlsx"], accept_multiple_files=True)
             gravar = st.form_submit_button("Armazenar arquivos")
@@ -537,10 +567,10 @@ def exibir_historico() -> Optional[pd.DataFrame]:
                         conteudo = arquivo.getvalue()
                         dados = carregar_dados(BytesIO(conteudo))
                         preparados.append(preparar_arquivo(arquivo.name, conteudo, dados))
-                    # Revalida antes de gravar caso o processamento leve tempo.
-                    if not sessao_autorizada(st.session_state, obter_usuarios()):
+                    if not restaurar_sessao():
                         st.rerun()
-                    resultado = repo.importar(preparados, st.session_state["usuario"])
+                    repo = RepositorioHistorico(st.session_state["cliente_supabase"])
+                    resultado = repo.importar(preparados)
                 st.success(f"{resultado['novos']} arquivo(s) armazenado(s); {resultado['repetidos']} já estavam no histórico.")
         st.button("Atualizar histórico")
         lista = repo.listar()
@@ -553,7 +583,8 @@ def exibir_historico() -> Optional[pd.DataFrame]:
         st.caption("Para um relatório corrigido, selecione a versão desejada e desmarque a anterior. Os originais continuam armazenados.")
         with st.expander("Arquivos armazenados"):
             st.dataframe(lista.drop(columns=['id']).rename(columns={
-                'nome': 'Arquivo', 'usuario': 'Importado por', 'importado_em': 'Importação (UTC)', 'linhas': 'Registros'
+                'nome': 'Arquivo', 'importado_por': 'Importado por',
+                'importado_em': 'Importação (UTC)', 'linhas': 'Registros'
             }), hide_index=True)
         df, removidas = repo.carregar(escolhidos)
         if removidas:
@@ -563,18 +594,17 @@ def exibir_historico() -> Optional[pd.DataFrame]:
             return None
         return df
     except ValueError:
-        st.error("Não foi possível importar. Confira se todos os arquivos são .xlsx de até 20 MB e têm Data e Status. Se o problema for na conexão, revise DATABASE_URL.")
+        st.error("Não foi possível importar. Confira se todos os arquivos são .xlsx de até 20 MB e têm Data e Status.")
         return None
-    except Exception as erro:
-        # Exceções SQL podem conter dados de pacientes e parâmetros de conexão.
+    except ErroHistorico as erro:
         LOGGER.error("Falha na operação do histórico (%s).", type(erro).__name__)
-        st.error("Não foi possível acessar ou atualizar o histórico. Confira os arquivos e a conexão do banco. Nenhum lote é gravado parcialmente.")
+        st.error("Não foi possível acessar ou atualizar o histórico no Supabase. Nenhum lote é gravado parcialmente.")
         return None
 
 
 def exibir_area_autenticada() -> None:
     """Disponibiliza a leitura de dados somente após a autenticação."""
-    if not sessao_autorizada(st.session_state, obter_usuarios()):
+    if st.session_state.get("autenticado") is not True:
         st.stop()
     verificar_sessao_periodicamente()
     st.sidebar.button("Sair", on_click=sair)
@@ -645,8 +675,7 @@ def exibir_area_autenticada() -> None:
 @st.fragment(run_every="60s")
 def verificar_sessao_periodicamente() -> None:
     """Revalida sem renovar a atividade quando a página permanece aberta."""
-    if not sessao_autorizada(st.session_state, obter_usuarios(), atualizar=False):
-        carregar_dados.clear()
+    if not restaurar_sessao(atualizar=False):
         st.rerun()
 
 
@@ -654,10 +683,8 @@ def main() -> None:
     st.set_page_config(page_title="Dashboard", layout="wide")
     inicializar_sessao()
 
-    estava_autenticado = st.session_state["autenticado"]
-    if not sessao_autorizada(st.session_state, obter_usuarios()):
-        if estava_autenticado:
-            carregar_dados.clear()
+    estava_autenticado = st.session_state.get("autenticado") is True
+    if not estava_autenticado or not restaurar_sessao():
         exibir_login()
         st.stop()
 
