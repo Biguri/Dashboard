@@ -16,7 +16,7 @@ python -m streamlit run app.py
 
 No Linux ou macOS, ative o ambiente com `source .venv/bin/activate`.
 
-O dashboard aceita `.xlsx` por upload manual, pela pasta de `app.py` ou pelo histórico no Supabase. O upload manual permanece apenas na sessão atual. O histórico armazena o arquivo original e os dados processáveis no banco da clínica autenticada.
+O dashboard recebe arquivos `.xlsx` por upload manual e os armazena no histórico do Supabase antes de exibir qualquer dado. O banco associa a importação à clínica autenticada por meio do JWT e das policies RLS. Depois do envio, o usuário pode analisar somente os arquivos recém-enviados ou selecionar arquivos do histórico da própria clínica.
 
 ## 1. Criar a estrutura no Supabase
 

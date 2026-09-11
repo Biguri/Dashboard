@@ -9,7 +9,6 @@ import os
 import re
 import time
 from numbers import Real
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -19,7 +18,6 @@ from supabase_acesso import (AcessoNegado, ConfiguracaoInvalida, carregar_config
                              criar_cliente, entrar, restaurar, sair as encerrar_supabase)
 
 
-PASTA_DADOS = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
 INATIVIDADE = 30 * 60
 DURACAO_MAXIMA = 8 * 60 * 60
@@ -147,20 +145,6 @@ def carregar_dados(arquivo, modificacao_ns: int = 0) -> pd.DataFrame:
             arquivo.seek(0)
         LOGGER.warning("Falha de conversão no openpyxl; tentando calamine.")
         return pd.read_excel(arquivo, engine="calamine")
-
-
-def encontrar_excel_mais_recente(pasta: Path) -> Optional[Path]:
-    """Seleciona o .xlsx mais recente, ignorando temporários do Excel."""
-    arquivos = [
-        arquivo
-        for arquivo in pasta.glob("*.xlsx")
-        if arquivo.is_file() and not arquivo.name.startswith("~$")
-    ]
-    return max(
-        arquivos,
-        key=lambda arquivo: arquivo.stat().st_mtime_ns,
-        default=None,
-    )
 
 
 def identificar_clinica(criado_por) -> str:
@@ -572,6 +556,12 @@ def exibir_historico() -> Optional[pd.DataFrame]:
                         st.rerun()
                     repo = RepositorioHistorico(st.session_state["cliente_supabase"])
                     resultado = repo.importar(preparados)
+                    st.session_state["arquivos_recem_enviados"] = [
+                        arquivo["id"] for arquivo in preparados
+                    ]
+                    st.session_state["modo_analise_historico"] = (
+                        "Somente arquivos recém-enviados"
+                    )
                 st.success(f"{resultado['novos']} arquivo(s) armazenado(s); {resultado['repetidos']} já estavam no histórico.")
         st.button("Atualizar histórico")
         lista = repo.listar()
@@ -579,8 +569,32 @@ def exibir_historico() -> Optional[pd.DataFrame]:
             st.info("Nenhum arquivo armazenado ainda.")
             return None
         rotulos = {r.id: f"{r.nome} · {r.id[:8]}" for r in lista.itertuples()}
-        escolhidos = st.multiselect("Arquivos incluídos na análise", lista['id'].tolist(),
-                                   default=lista['id'].tolist(), format_func=rotulos.get)
+        ids_disponiveis = lista['id'].tolist()
+        recentes = [
+            identificador
+            for identificador in st.session_state.get("arquivos_recem_enviados", [])
+            if identificador in ids_disponiveis
+        ]
+        modos = ["Somente arquivos recém-enviados", "Selecionar arquivos do histórico"]
+        if "modo_analise_historico" not in st.session_state:
+            st.session_state["modo_analise_historico"] = modos[0] if recentes else modos[1]
+        modo = st.radio(
+            "Quais arquivos analisar?",
+            modos,
+            key="modo_analise_historico",
+            horizontal=True,
+        )
+        if modo == modos[0]:
+            escolhidos = recentes
+            if not recentes:
+                st.info("Envie um arquivo nesta sessão ou escolha arquivos do histórico.")
+        else:
+            escolhidos = st.multiselect(
+                "Arquivos incluídos na análise",
+                ids_disponiveis,
+                default=ids_disponiveis,
+                format_func=rotulos.get,
+            )
         st.caption("Para um relatório corrigido, selecione a versão desejada e desmarque a anterior. Os originais continuam armazenados.")
         with st.expander("Arquivos armazenados"):
             st.dataframe(lista.drop(columns=['id']).rename(columns={
@@ -610,59 +624,16 @@ def exibir_area_autenticada() -> None:
     verificar_sessao_periodicamente()
     st.sidebar.button("Sair", on_click=sair)
     st.title("Dashboard de Agendamentos")
-    st.sidebar.header("Fonte de Dados")
-    metodo_leitura = st.sidebar.radio(
-        "Como deseja carregar os dados?",
-        ["Upload Manual", "Pasta Automática", "Histórico na nuvem"],
+    st.sidebar.header("Dados da clínica")
+    st.sidebar.caption(
+        "Uploads são armazenados no Supabase e isolados pela clínica da conta."
     )
-
-    df = None
-    try:
-        if metodo_leitura == "Upload Manual":
-            arquivo_up = st.sidebar.file_uploader(
-                "Anexe a planilha de agendamentos", type=["xlsx"]
-            )
-            if arquivo_up is not None:
-                df = carregar_dados(arquivo_up)
-        elif metodo_leitura == "Histórico na nuvem":
-            df = exibir_historico()
-        else:
-            st.sidebar.info(f"Buscando arquivos .xlsx em: {PASTA_DADOS}")
-            # O clique reexecuta o script e verifica a pasta novamente.
-            st.sidebar.button("Verificar novos arquivos")
-            arquivo_recente = encontrar_excel_mais_recente(PASTA_DADOS)
-            if arquivo_recente is None:
-                st.warning("Nenhum arquivo .xlsx encontrado na pasta.")
-            else:
-                df = carregar_dados(
-                    str(arquivo_recente),
-                    modificacao_ns=arquivo_recente.stat().st_mtime_ns,
-                )
-                st.sidebar.success(f"Lendo: {arquivo_recente.name}")
-    except ImportError:
-        st.error(
-            "Falta uma dependência para a leitura de Excel. "
-            "Instale com: python -m pip install openpyxl python-calamine"
-        )
-        return
-    except PermissionError:
-        st.error("Sem permissão para ler a planilha. Verifique o acesso ao arquivo.")
-        return
-    except FileNotFoundError:
-        st.error("O arquivo foi removido ou movido. Selecione a fonte novamente.")
-        return
-    except Exception:
-        LOGGER.exception("Falha ao carregar planilha pelo modo %s", metodo_leitura)
-        st.error(
-            "Não foi possível carregar a planilha. "
-            "Confira o arquivo ou contate o administrador."
-        )
-        return
+    df = exibir_historico()
 
     if df is not None:
         df, avisos = limpar_dados(df)
         chave_agendamento = ["ID paciente", COLUNAS["data"], "Hora Início", "Hora Fim", "Profissional"]
-        if metodo_leitura == "Histórico na nuvem" and all(c in df for c in chave_agendamento):
+        if all(c in df for c in chave_agendamento):
             semelhantes = int(df.duplicated(chave_agendamento, keep=False).sum())
             if semelhantes:
                 st.warning(f"{semelhantes} registros têm o mesmo paciente, data, horário e profissional. Eles foram preservados. Confira relatórios sobrepostos na seleção de arquivos antes de interpretar os totais.")

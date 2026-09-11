@@ -1,5 +1,4 @@
 from io import BytesIO
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -8,7 +7,7 @@ from zipfile import ZipFile, BadZipFile
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
-from app import carregar_dados, encontrar_excel_mais_recente
+from app import carregar_dados
 
 
 class LeituraTests(unittest.TestCase):
@@ -60,19 +59,6 @@ class LeituraTests(unittest.TestCase):
     def test_arquivo_invalido_nao_produz_dados(self):
         with self.assertRaises(BadZipFile):
             carregar_dados.__wrapped__(BytesIO(b'arquivo invalido'))
-
-    def test_busca_ignora_temporarios_e_seleciona_modificacao(self):
-        with TemporaryDirectory() as tmp:
-            pasta = Path(tmp)
-            self.assertIsNone(encontrar_excel_mais_recente(pasta))
-            antigo = pasta / 'antigo.xlsx'
-            recente = pasta / 'recente.xlsx'
-            temporario = pasta / '~$aberto.xlsx'
-            for arquivo, data in [(antigo, 100), (recente, 200), (temporario, 300)]:
-                arquivo.write_bytes(b'teste')
-                os.utime(arquivo, (data, data))
-            self.assertEqual(encontrar_excel_mais_recente(pasta), recente)
-
 
 if __name__ == '__main__':
     unittest.main()
