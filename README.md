@@ -1,5 +1,7 @@
 # Dashboard de Agendamentos
 
+[![Python tests](https://github.com/Biguri/Dashboard/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Biguri/Dashboard/actions/workflows/tests.yml)
+
 Aplicação Streamlit para analisar relatórios Excel de agendamentos, com autenticação pelo Supabase e histórico persistente isolado por clínica por meio de Row Level Security (RLS).
 
 ## Executar localmente
