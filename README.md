@@ -87,3 +87,20 @@ SUPABASE_PUBLISHABLE_KEY = "SUA_CHAVE_PUBLICAVEL"
 
 Também é possível usar variáveis de ambiente com os mesmos nomes. Variáveis de ambiente têm precedência sobre `st.secrets`.
 
+
+## Testes automatizados
+
+Execute na raiz do projeto, com o ambiente virtual ativo e as dependências instaladas:
+
+```bash
+python -m unittest discover -s . -p "test_*.py" -v
+```
+
+O workflow [Python tests](.github/workflows/tests.yml) executa essa suíte em
+pull requests direcionados à `main`, em pushes na `main` e por acionamento
+manual no GitHub Actions. A versão do Python é lida de `.python-version`.
+
+A suíte usa dados fictícios e substitutos locais dos serviços externos; não
+exige credenciais Supabase. Ela verifica processamento de planilhas, histórico,
+autenticação e comportamento da interface. Não comprova as policies RLS de um
+banco remoto nem substitui a validação de integração em um Supabase de teste.
